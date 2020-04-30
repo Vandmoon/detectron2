@@ -7,6 +7,7 @@ typical object detection data pipeline.
 """
 import logging
 import numpy as np
+import pycocotools.mask as mask_util
 import torch
 from fvcore.common.file_io import PathManager
 from PIL import Image, ImageOps
@@ -19,11 +20,7 @@ from detectron2.structures import (
     Keypoints,
     PolygonMasks,
     RotatedBoxes,
-    ###### For segment-based detection #######
-    ContourMaps,
-    SegMasks,
-    SemSegMask,
-    ##########################################
+    polygons_to_bitmask,
 )
 
 from . import transforms as T
@@ -46,7 +43,7 @@ def read_image(file_name, format=None):
         format (str): one of the supported image modes in PIL, or "BGR"
 
     Returns:
-        image (np.ndarray): an HWC image
+        image (np.ndarray): an HWC image in the given format.
     """
     with PathManager.open(file_name, "rb") as f:
         image = Image.open(f)
@@ -171,8 +168,25 @@ def transform_instance_annotations(
 
     if "segmentation" in annotation:
         # each instance contains 1 or more polygons
-        polygons = [np.asarray(p).reshape(-1, 2) for p in annotation["segmentation"]]
-        annotation["segmentation"] = [p.reshape(-1) for p in transforms.apply_polygons(polygons)]
+        segm = annotation["segmentation"]
+        if isinstance(segm, list):
+            # polygons
+            polygons = [np.asarray(p).reshape(-1, 2) for p in segm]
+            annotation["segmentation"] = [
+                p.reshape(-1) for p in transforms.apply_polygons(polygons)
+            ]
+        elif isinstance(segm, dict):
+            # RLE
+            mask = mask_util.decode(segm)
+            mask = transforms.apply_segmentation(mask)
+            assert tuple(mask.shape[:2]) == image_size
+            annotation["segmentation"] = mask
+        else:
+            raise ValueError(
+                "Cannot transform segmentation of type '{}'!"
+                "Supported types are: polygons as list[list[float] or ndarray],"
+                " COCO-style RLE as a dict.".format(type(segm))
+            )
 
     if "keypoints" in annotation:
         keypoints = transform_keypoint_annotations(
@@ -243,47 +257,43 @@ def annotations_to_instances(annos, image_size, mask_format="polygon"):
     target.gt_classes = classes
 
     if len(annos) and "segmentation" in annos[0]:
-        polygons = [obj["segmentation"] for obj in annos]
+        segms = [obj["segmentation"] for obj in annos]
         if mask_format == "polygon":
-            masks = PolygonMasks(polygons)
+            masks = PolygonMasks(segms)
         else:
             assert mask_format == "bitmask", mask_format
-            masks = BitMasks.from_polygon_masks(polygons, *image_size)
+            masks = []
+            for segm in segms:
+                if isinstance(segm, list):
+                    # polygon
+                    masks.append(polygons_to_bitmask(segm, *image_size))
+                elif isinstance(segm, dict):
+                    # COCO RLE
+                    masks.append(mask_util.decode(segm))
+                elif isinstance(segm, np.ndarray):
+                    assert segm.ndim == 2, "Expect segmentation of 2 dimensions, got {}.".format(
+                        segm.ndim
+                    )
+                    # mask array
+                    masks.append(segm)
+                else:
+                    raise ValueError(
+                        "Cannot convert segmentation of type '{}' to BitMasks!"
+                        "Supported types are: polygons as list[list[float] or ndarray],"
+                        " COCO-style RLE as a dict, or a full-image segmentation mask "
+                        "as a 2D ndarray.".format(type(segm))
+                    )
+            # torch.from_numpy does not support array with negative stride.
+            masks = BitMasks(
+                torch.stack([torch.from_numpy(np.ascontiguousarray(x)) for x in masks])
+            )
         target.gt_masks = masks
-        
+
     if len(annos) and "keypoints" in annos[0]:
         kpts = [obj.get("keypoints", []) for obj in annos]
         target.gt_keypoints = Keypoints(kpts)
 
     return target
-
-
-def annotations_to_segmaps(annos, num_classes, image_size):
-    """
-    Create image-level semantic segmenations and contour maps from instance annotations in the dataset dict.
-
-    Args:
-        annos (list[dict]): a list of instance annotations in one image, each
-            element for one instance.
-        num_classes (int): number of object categories.
-        image_size (tuple): height, width.
-
-    Returns:
-        semantic segmentations and contour maps.
-    """
-    height = image_size[0]
-    width = image_size[1]
-    classes = [obj["category_id"] for obj in annos]
-
-    #print("Annos: ", annos)
-    #assert(len(annos) and "segmentation" in annos[0])
-    target = Instances(image_size)
-    polygons = [obj["segmentation"] for obj in annos]
-    #target.gt_segmasks = SegMasks.from_polygons(polygons, classes, height, width, num_classes)
-    gt_semseg = SemSegMask.from_polygons(polygons, classes, height, width, num_classes)
-    target.gt_contours = ContourMaps.from_polygons(polygons, classes, height, width, num_classes)
-
-    return target, gt_semseg
 
 
 def annotations_to_instances_rotated(annos, image_size):
@@ -315,7 +325,7 @@ def annotations_to_instances_rotated(annos, image_size):
     return target
 
 
-def filter_empty_instances(instances, by_box=True, by_mask=True):
+def filter_empty_instances(instances, by_box=True, by_mask=True, box_threshold=1e-5):
     """
     Filter out empty instances in an `Instances` object.
 
@@ -323,6 +333,7 @@ def filter_empty_instances(instances, by_box=True, by_mask=True):
         instances (Instances):
         by_box (bool): whether to filter out instances with empty boxes
         by_mask (bool): whether to filter out instances with empty masks
+        box_threshold (float): minimum width and height to be considered non-empty
 
     Returns:
         Instances: the filtered instances.
@@ -330,7 +341,7 @@ def filter_empty_instances(instances, by_box=True, by_mask=True):
     assert by_box or by_mask
     r = []
     if by_box:
-        r.append(instances.gt_boxes.nonempty())
+        r.append(instances.gt_boxes.nonempty(threshold=box_threshold))
     if instances.has("gt_masks") and by_mask:
         r.append(instances.gt_masks.nonempty())
 
@@ -380,6 +391,12 @@ def gen_crop_transform_with_instance(crop_size, image_size, instance):
     crop_size = np.asarray(crop_size, dtype=np.int32)
     bbox = BoxMode.convert(instance["bbox"], instance["bbox_mode"], BoxMode.XYXY_ABS)
     center_yx = (bbox[1] + bbox[3]) * 0.5, (bbox[0] + bbox[2]) * 0.5
+    assert (
+        image_size[0] >= center_yx[0] and image_size[1] >= center_yx[1]
+    ), "The annotation bounding box is outside of the image!"
+    assert (
+        image_size[0] >= crop_size[0] and image_size[1] >= crop_size[1]
+    ), "Crop size is larger than image size!"
 
     min_yx = np.maximum(np.floor(center_yx).astype(np.int32) - crop_size, 0)
     max_yx = np.maximum(np.asarray(image_size, dtype=np.int32) - crop_size, 0)
