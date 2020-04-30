@@ -177,7 +177,10 @@ _C.MODEL.ANCHOR_GENERATOR.ASPECT_RATIOS = [[0.5, 1.0, 2.0]]
 # list[float], the angle in degrees, for each input feature map.
 # ANGLES[i] specifies the list of angles for IN_FEATURES[i].
 _C.MODEL.ANCHOR_GENERATOR.ANGLES = [[-90, 0, 90]]
-
+# Relative offset between the center of the first anchor and the top-left corner of the image
+# Value has to be in [0, 1). Recommend to use 0.5, which means half stride.
+# The value is not expected to affect model accuracy.
+_C.MODEL.ANCHOR_GENERATOR.OFFSET = 0.0
 
 # ---------------------------------------------------------------------------- #
 # RPN options
@@ -294,6 +297,8 @@ _C.MODEL.ROI_BOX_HEAD.CONV_DIM = 256
 _C.MODEL.ROI_BOX_HEAD.NORM = ""
 # Whether to use class agnostic for bbox regression
 _C.MODEL.ROI_BOX_HEAD.CLS_AGNOSTIC_BBOX_REG = False
+# If true, RoI heads use bounding boxes predicted by the box head rather than proposal boxes.
+_C.MODEL.ROI_BOX_HEAD.TRAIN_ON_PRED_BOXES = False
 
 # ---------------------------------------------------------------------------- #
 # Cascaded Box Head
@@ -550,6 +555,19 @@ _C.SOLVER.IMS_PER_BATCH = 16
 _C.SOLVER.BIAS_LR_FACTOR = 1.0
 _C.SOLVER.WEIGHT_DECAY_BIAS = _C.SOLVER.WEIGHT_DECAY
 
+# Gradient clipping
+_C.SOLVER.CLIP_GRADIENTS = CN({"ENABLED": False})
+# Type of gradient clipping, currently 2 values are supported:
+# - "value": the absolute values of elements of each gradients are clipped
+# - "norm": the norm of the gradient for each parameter is clipped thus
+#   affecting all elements in the parameter
+_C.SOLVER.CLIP_GRADIENTS.CLIP_TYPE = "value"
+# Maximum absolute value used for clipping gradients
+_C.SOLVER.CLIP_GRADIENTS.CLIP_VALUE = 1.0
+# Floating point number p for L-p norm to be used with the "norm"
+# gradient clipping type; for L-inf, please specify .inf
+_C.SOLVER.CLIP_GRADIENTS.NORM_TYPE = 2.0
+
 # ---------------------------------------------------------------------------- #
 # Specific test options
 # ---------------------------------------------------------------------------- #
@@ -591,6 +609,9 @@ _C.SEED = -1
 # for about 10k iterations. It usually hurts total time, but can benefit for certain models.
 # If input images have the same or similar sizes, benchmark is often helpful.
 _C.CUDNN_BENCHMARK = False
+# The period (in terms of steps) for minibatch visualization at train time.
+# Set to 0 to disable.
+_C.VIS_PERIOD = 0
 
 # global config is for quick hack purposes.
 # You can set them in command line or config files,
